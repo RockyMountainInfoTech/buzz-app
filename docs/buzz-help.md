@@ -1070,6 +1070,13 @@ confirmation. **Delete team** asks first; it doesn't delete the team's agents.
 
 ## Optional features and limits
 
+### Device-bound organizational sign-in
+
+Some organization builds on macOS tie sign-in to a device key. If the key is
+missing, sign in again; the saved session alone cannot restore access. When a
+sensitive action asks for recent authentication, sign in again for that action.
+That request does not end an otherwise usable session.
+
 - Plugins can add features. **Settings → Plugins → Manage plugins** controls
   them. Do not assume a particular optional plugin is on.
   A page whose plugin is turned off says so, and its **Manage plugins** opens
