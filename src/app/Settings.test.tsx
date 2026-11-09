@@ -806,6 +806,7 @@ export function apply(ctx) {
         folder: vi.fn(),
         files: vi.fn(),
         git: vi.fn(async () => preview),
+        url: vi.fn(),
         checkGit: vi.fn(async () => preview),
         checkFolder: vi.fn(async () => ({
           revision: signed.revision,
