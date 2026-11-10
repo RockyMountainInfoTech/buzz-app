@@ -1,4 +1,4 @@
-import { useState, useSyncExternalStore, type ReactNode } from "react";
+import { useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import type { FederatedIdentity, SessionSnapshot } from "./service";
 import type { Membership } from "../communities/service";
 import { communityDestination } from "../communities/destination";
@@ -53,8 +53,10 @@ function explains(state: SessionSnapshot, error: string | undefined) {
 const noSubscribe = () => () => {};
 const noSnapshot = () => undefined;
 
-/** True while `CommunitySignIn` shows its own message for `error`, so the
- * caller does not also show the raw error. */
+/** True once `CommunitySignIn` has explained `error`, so the caller does
+ * not also show the raw error. It stays true until `error` clears: a sign-in
+ * that resolves the refusal publishes signed-in before its retry clears the
+ * error, and the raw error must not mount as an alert in between. */
 export function useExplainedRefusal(
   identity: FederatedIdentity | undefined,
   error: string | undefined,
@@ -64,7 +66,10 @@ export function useExplainedRefusal(
     identity?.snapshot ?? noSnapshot,
     identity?.snapshot ?? noSnapshot,
   );
-  return !!state && !!error && explains(state, error);
+  const explained = useRef<string | undefined>(undefined);
+  if (!error) explained.current = undefined;
+  else if (state && explains(state, error)) explained.current = error;
+  return !!error && explained.current === error;
 }
 
 /** Explicit recovery from native protected-community admission; never automatic login. */
