@@ -488,6 +488,133 @@ it("owns both update subscriptions with the calling plugin lifetime", async () =
   }
 });
 
+it("reports only recognized installation source kinds from ready catalog data", async () => {
+  const bundled = info("example.bundled");
+  bundled.source = "bundled";
+  bundled.updateSource = { root: "/plugins/bundled", path: "." };
+  const git = info("example.git");
+  git.updateSource = { ...base, path: "example-git" };
+  const url = info("example.url");
+  url.updateSource = {
+    url: "https://artifacts.example.com/plugins/example.url.json",
+    sha256: "ab".repeat(32),
+  };
+  const folder = info("example.folder");
+  folder.updateSource = { root: "/plugins/example-folder", path: "." };
+  const windowsFolder = info("example.windows-folder");
+  windowsFolder.updateSource = {
+    root: "C:\\plugins\\example-folder",
+    path: ".",
+  };
+  const { as, core } = setup({
+    plugins: [bundled, git, url, folder, windowsFolder],
+  });
+  const installer = await as("example.market");
+  const expected = {
+    "example.bundled": "bundled",
+    "example.git": "git",
+    "example.url": "url",
+    "example.folder": "folder",
+    "example.windows-folder": "folder",
+    "example.missing": "absent",
+  } as const;
+
+  expect(installer.getInstallationSource).toBeTypeOf("function");
+  for (const [id, kind] of Object.entries(expected)) {
+    expect(installer.getInstallationSource?.(id)).toBe(kind);
+    expect(core.getInstallationSource(id)).toBe(kind);
+  }
+});
+
+it("keeps unknown or malformed source metadata unavailable without side effects", async () => {
+  const malformed = [
+    { id: "example.no-source", source: null },
+    { id: "example.unknown", source: { provider: "external" } },
+    {
+      id: "example.invalid-repository",
+      source: { ...base, repository: "http://example.com/plugins.git" },
+    },
+    {
+      id: "example.invalid-reference",
+      source: { ...base, reference: "../main" },
+    },
+    {
+      id: "example.invalid-git-path",
+      source: { ...base, path: "../plugin" },
+    },
+    {
+      id: "example.invalid-commit",
+      source: { ...base, commit: "not-a-commit" },
+    },
+    {
+      id: "example.invalid-url",
+      source: {
+        url: "http://artifacts.example.com/plugins/example.json",
+        sha256: "ab".repeat(32),
+      },
+    },
+    {
+      id: "example.invalid-sha256",
+      source: {
+        url: "https://artifacts.example.com/plugins/example.json",
+        sha256: "not-a-digest",
+      },
+    },
+    {
+      id: "example.relative-folder-root",
+      source: { root: "plugins/example-folder", path: "." },
+    },
+    {
+      id: "example.invalid-folder-path",
+      source: { root: "/plugins/example-folder", path: "../plugin" },
+    },
+    {
+      id: "example.ambiguous",
+      source: { ...base, path: ".", root: "/plugins/ambiguous" },
+    },
+  ].map(({ id, source }) => {
+    const plugin = info(id);
+    plugin.updateSource = source as never;
+    return plugin;
+  });
+  const imports = {
+    files: vi.fn(),
+    git: vi.fn(),
+    url: vi.fn(),
+    install: vi.fn(),
+    discard: vi.fn(),
+    checkGit: vi.fn(),
+    checkFolder: vi.fn(),
+    previewFolder: vi.fn(),
+  };
+  const f = setup({ plugins: malformed, imports });
+  const installer = await f.as("example.market");
+  const request = vi.spyOn(f.requests, "request");
+
+  for (const plugin of malformed) {
+    const id = plugin.manifest.id;
+    expect(installer.getInstallationSource?.(id)).toBe("unavailable");
+    expect(f.core.getInstallationSource(id)).toBe(
+      installer.getInstallationSource?.(id),
+    );
+  }
+  f.set({ status: "loading" });
+  expect(installer.getInstallationSource?.("example.missing")).toBe(
+    "unavailable",
+  );
+  expect(f.core.getInstallationSource("example.missing")).toBe("unavailable");
+  f.set(ready([]));
+  expect(installer.getInstallationSource?.("example.missing")).toBe("absent");
+  expect(f.core.getInstallationSource("example.missing")).toBe("absent");
+
+  expect(request).not.toHaveBeenCalled();
+  expect(f.requests.snapshot()).toBeUndefined();
+  expect(f.managerListenerCount()).toBe(0);
+  expect(f.open).not.toHaveBeenCalled();
+  for (const operation of Object.values(imports))
+    expect(operation).not.toHaveBeenCalled();
+});
+
 it("keeps unavailable configuration distinct from absence and emits presence changes", async () => {
   const { as, set } = setup({ plugins: [] });
   const installer = await as("example.market");

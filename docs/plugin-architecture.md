@@ -393,6 +393,9 @@ type PluginInstaller = {
   getInstallationStatus(
     id: string,
   ): "installed" | "absent" | "unavailable";
+  getInstallationSource?(
+    id: string,
+  ): "git" | "url" | "folder" | "bundled" | "absent" | "unavailable";
   subscribeInstallationStatus(
     id: string,
     listener: (status: "installed" | "absent" | "unavailable") => void,
@@ -545,6 +548,15 @@ replacement or host restart, so old identities then resolve as `unknown` and
 this contract does not provide cross-restart idempotency. An absent capability
 or an `unavailable` snapshot is not evidence that a prior ambiguous submission
 was rejected. A refresh does not resolve an earlier ambiguous submission.
+
+`getInstallationSource` is also optional on older hosts. In a ready catalog it
+returns `absent` only when the manifest ID is missing; for a present plugin it
+returns `bundled` or a recognized saved external source kind (`git`, `url`, or
+`folder`). Before the catalog is ready, or when saved source metadata is missing,
+unknown, malformed, or ambiguous, it returns `unavailable`. It returns no source
+location or other saved metadata, and does not check for or establish an update.
+Folder metadata is recognized only when its root is an absolute path and its
+plugin path is relative.
 
 `requestInstall` never installs silently. It opens Settings → Plugins with the Git
 source prefilled and read-only, and the user still chooses **Find**, reviews the
