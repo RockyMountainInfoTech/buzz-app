@@ -1,14 +1,16 @@
 import {
   Children,
+  createContext,
+  Fragment,
   isValidElement,
   memo,
-  useCallback,
+  useContext,
   useMemo,
   useRef,
   useState,
   type ReactNode,
 } from "react";
-import Markdown, { type ExtraProps } from "react-markdown";
+import Markdown, { type Components, type ExtraProps } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkBreaks from "remark-breaks";
 import type { PhrasingContent, Root, RootContent } from "mdast";
@@ -175,19 +177,30 @@ function githubHtml() {
 }
 
 function EmbeddedAttachment({
+  src,
   children,
   fallback,
   caption,
   onMedia,
 }: {
-  children: ReactNode;
+  src: string;
+  children(src: string): ReactNode;
   fallback: ReactNode;
   caption: ReactNode;
   onMedia?: ((loaded: boolean) => void) | undefined;
 }) {
   const [loaded, setLoaded] = useState(false);
+  // Signed sources change on every read: media keeps the one it shows, so it
+  // does not reload or restart, until that one fails.
+  const [shown, setShown] = useState(src);
+  const [expired, setExpired] = useState(false);
+  if (expired && src !== shown) {
+    setShown(src);
+    setExpired(false);
+  }
   const show = (next: boolean) => {
     setLoaded(next);
+    if (!next) setExpired(true);
     onMedia?.(next);
   };
   return (
@@ -197,16 +210,53 @@ function EmbeddedAttachment({
       onLoadedDataCapture={() => show(true)}
       onErrorCapture={() => show(false)}
     >
-      {children}
+      {/* Media keeps a failure until remounted with a new source. */}
+      <Fragment key={shown}>{children(shown)}</Fragment>
       {loaded ? caption : fallback}
     </div>
   );
 }
 
+type Media = (
+  source: string,
+  label: ReactNode,
+  image?: boolean,
+  description?: string,
+) => ReactNode;
+const MediaContext = createContext<Media>((source) => source);
+
+// Stable across renders, so a body read again keeps its media elements.
+const components: Components = {
+  // Players are block elements, including when embedded in prose.
+  p: ({ children }) => <div className={styles.paragraph}>{children}</div>,
+  a: function MarkdownLink({ href, children, node }) {
+    const media = useContext(MediaContext);
+    if (!href) return <>{children}</>;
+    if (node && containsImage(node))
+      return (
+        <div>
+          {children}
+          <a href={href} target="_blank" rel="noreferrer">
+            {href}
+          </a>
+        </div>
+      );
+    return media(href, children, false, plainText(children) || undefined);
+  },
+  img: function MarkdownImage({ src, alt }) {
+    const media = useContext(MediaContext);
+    return typeof src === "string" && src ? media(src, alt, true, alt) : alt;
+  },
+  table: ({ children }) => (
+    <div className={styles.tableScroll}>
+      <table>{children}</table>
+    </div>
+  ),
+};
+
 /** Signed media links in `bodyHtml` change on every read and expire within
- * minutes. The body keeps the links it shows, so media does not reload or
- * restart, until the body changes or shown media fails; then it reads GitHub
- * once with `refresh` and shows the links read. */
+ * minutes. Media keeps the link it shows until that one fails; then it reads
+ * GitHub again with `refresh` and shows the link read. */
 export const GitHubBody = memo(function GitHubBody({
   body,
   bodyHtml,
@@ -216,46 +266,7 @@ export const GitHubBody = memo(function GitHubBody({
   body: string;
   bodyHtml?: string | undefined;
   url: string;
-  refresh?: (() => void) | undefined;
-}) {
-  const [shown, setShown] = useState({ body, html: bodyHtml });
-  const [stale, setStale] = useState(false);
-  if (body !== shown.body || (stale && bodyHtml !== shown.html)) {
-    setShown({ body, html: bodyHtml });
-    setStale(false);
-  }
-  // Media that failed since it last loaded does not read again, and media
-  // failing together reads once.
-  const failed = useRef(new Set<string>());
-  const requested = useRef<string | undefined>(undefined);
-  const renew = useCallback(
-    (source: string, loaded: boolean) => {
-      if (loaded) failed.current.delete(source);
-      if (loaded || !refresh || failed.current.has(source)) return;
-      failed.current.add(source);
-      setStale(true);
-      if (requested.current === shown.html) return;
-      requested.current = shown.html;
-      refresh();
-    },
-    [refresh, shown.html],
-  );
-  return (
-    <Body body={shown.body} bodyHtml={shown.html} url={url} renew={renew} />
-  );
-});
-
-const Body = memo(function Body({
-  body,
-  bodyHtml,
-  url,
-  renew,
-}: {
-  body: string;
-  bodyHtml: string | undefined;
-  url: string;
-  /** Media with a signed source loaded, or failed. */
-  renew(source: string, loaded: boolean): void;
+  refresh?: (() => Promise<unknown>) | undefined;
 }) {
   const bounded = useMemo(
     () => body.length <= MAX_MARKDOWN_LENGTH && !scanMarkdown(body).tooDeep,
@@ -265,14 +276,25 @@ const Body = memo(function Body({
     () => (bounded ? attachmentMetadata(bodyHtml) : new Map()),
     [bounded, bodyHtml],
   );
+  // One read at a time; media that failed since it last loaded does not
+  // read again.
+  const failed = useRef(new Set<string>());
+  const reading = useRef(false);
   if (!bounded) return <div className={styles.plainBody}>{body}</div>;
 
-  const media = (
-    source: string,
-    label: ReactNode,
-    image = false,
-    description?: string,
-  ) => {
+  const renew = (source: string, loaded: boolean) => {
+    if (loaded) failed.current.delete(source);
+    if (loaded || !refresh || failed.current.has(source)) return;
+    failed.current.add(source);
+    if (reading.current) return;
+    reading.current = true;
+    const done = () => {
+      reading.current = false;
+    };
+    refresh().then(done, done);
+  };
+
+  const media: Media = (source, label, image = false, description) => {
     const attachment = attachmentFor(source, metadata, image);
     const link = (
       <a href={source} target="_blank" rel="noreferrer">
@@ -281,9 +303,9 @@ const Body = memo(function Body({
     );
     if (!attachment) return link;
     return (
-      // Media keeps a failure until remounted with a new source.
       <EmbeddedAttachment
-        key={attachment.url}
+        key={source}
+        src={attachment.url}
         {...(attachment.url !== source && {
           onMedia: (loaded: boolean) => renew(source, loaded),
         })}
@@ -294,61 +316,35 @@ const Body = memo(function Body({
             : null
         }
       >
-        {attachment.kind === "audio" ? (
-          <AudioAttachment attachment={attachment} source={attachment.url} />
-        ) : (
-          <MediaAttachment
-            attachment={attachment}
-            media={(value) => value}
-            {...(description !== undefined
-              ? { imageDescription: description }
-              : {})}
-            preload="metadata"
-          />
-        )}
+        {(src) =>
+          attachment.kind === "audio" ? (
+            <AudioAttachment attachment={attachment} source={src} />
+          ) : (
+            <MediaAttachment
+              attachment={attachment}
+              media={() => src}
+              {...(description !== undefined
+                ? { imageDescription: description }
+                : {})}
+              preload="metadata"
+            />
+          )
+        }
       </EmbeddedAttachment>
     );
   };
 
   return (
     <div className={styles.body}>
-      <Markdown
-        remarkPlugins={[remarkGfm, remarkBreaks, githubHtml]}
-        urlTransform={(value) => bodyUrl(value, url) ?? ""}
-        components={{
-          // Players are block elements, including when embedded in prose.
-          p: ({ children }) => (
-            <div className={styles.paragraph}>{children}</div>
-          ),
-          a: ({ href, children, node }) => {
-            if (!href) return <>{children}</>;
-            if (node && containsImage(node))
-              return (
-                <div>
-                  {children}
-                  <a href={href} target="_blank" rel="noreferrer">
-                    {href}
-                  </a>
-                </div>
-              );
-            return media(
-              href,
-              children,
-              false,
-              plainText(children) || undefined,
-            );
-          },
-          img: ({ src, alt }) =>
-            typeof src === "string" && src ? media(src, alt, true, alt) : alt,
-          table: ({ children }) => (
-            <div className={styles.tableScroll}>
-              <table>{children}</table>
-            </div>
-          ),
-        }}
-      >
-        {body}
-      </Markdown>
+      <MediaContext value={media}>
+        <Markdown
+          remarkPlugins={[remarkGfm, remarkBreaks, githubHtml]}
+          urlTransform={(value) => bodyUrl(value, url) ?? ""}
+          components={components}
+        >
+          {body}
+        </Markdown>
+      </MediaContext>
     </div>
   );
 });

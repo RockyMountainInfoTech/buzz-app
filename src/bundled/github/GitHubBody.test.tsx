@@ -215,60 +215,89 @@ it("keeps original links when media fails before loading", () => {
   }
 });
 
-it("shows private media from signed links and reads the body again once when they fail", () => {
-  const signed = (jwt: string) =>
-    `https://private-user-images.githubusercontent.com/1888043/1-cd0773ee-9861-46d9-8a0f-352ae951ec7f.png?jwt=${jwt}`;
-  const html = (jwt: string) =>
-    `<p><a href="${signed(jwt)}"><img src="${signed(jwt)}" alt="Screenshot"></a></p><video src="${signedBefore.replace("expired", jwt)}"></video>`;
-  const refresh = vi.fn();
-  const body = `![Screenshot](${image})\n\n${before}`;
+const signedImage = (jwt: string) =>
+  `https://private-user-images.githubusercontent.com/1888043/1-cd0773ee-9861-46d9-8a0f-352ae951ec7f.png?jwt=${jwt}`;
+const signedVideo = (jwt: string) => signedBefore.replace("expired", jwt);
+const signedHtml = (jwt: string) =>
+  `<p><a href="${signedImage(jwt)}"><img src="${signedImage(jwt)}" alt="Screenshot"></a></p><video src="${signedVideo(jwt)}"></video>`;
+const signedBody = `![Screenshot](${image})\n\n${before}`;
+
+it("renews only failed private media from signed links, keeping media that works", async () => {
+  const read = deferred<void>();
+  const refresh = vi.fn(() => read.promise);
   const { container, rerender } = render(
-    <GitHubBody url={url} body={body} bodyHtml={html("1")} refresh={refresh} />,
+    <GitHubBody
+      url={url}
+      body={signedBody}
+      bodyHtml={signedHtml("1")}
+      refresh={refresh}
+    />,
   );
-  const sources = () =>
-    [...container.querySelectorAll("img, video")].map((media) =>
-      media.getAttribute("src"),
-    );
-  expect(sources()).toEqual([
-    signed("1"),
-    signedBefore.replace("expired", "1"),
-  ]);
-  // Failing together, they read the body once; the original links remain.
+  const video = container.querySelector("video") as HTMLVideoElement;
+  expect(screen.getByAltText("Screenshot")).toHaveAttribute(
+    "src",
+    signedImage("1"),
+  );
+  expect(video).toHaveAttribute("src", signedVideo("1"));
+  fireEvent.loadedData(video);
+  // The original link remains while the failed image renews.
   fireEvent.error(screen.getByAltText("Screenshot"));
-  fireEvent.error(container.querySelector("video") as HTMLVideoElement);
   expect(refresh).toHaveBeenCalledOnce();
   expect(screen.getByRole("link", { name: "Screenshot" })).toHaveAttribute(
     "href",
     image,
   );
-  expect(screen.getByRole("link", { name: before })).toHaveAttribute(
-    "href",
-    before,
-  );
   rerender(
-    <GitHubBody url={url} body={body} bodyHtml={html("2")} refresh={refresh} />,
+    <GitHubBody
+      url={url}
+      body={signedBody}
+      bodyHtml={signedHtml("2")}
+      refresh={refresh}
+    />,
   );
-  expect(sources()).toEqual([
-    signed("2"),
-    signedBefore.replace("expired", "2"),
-  ]);
-  // Working media keeps its source when the body is read again.
-  fireEvent.load(screen.getByAltText("Screenshot"));
-  rerender(
-    <GitHubBody url={url} body={body} bodyHtml={html("3")} refresh={refresh} />,
+  expect(screen.getByAltText("Screenshot")).toHaveAttribute(
+    "src",
+    signedImage("2"),
   );
-  expect(screen.getByAltText("Screenshot")).toHaveAttribute("src", signed("2"));
-  // A renewed source that fails before loading does not read again.
-  fireEvent.error(container.querySelector("video") as HTMLVideoElement);
-  expect(refresh).toHaveBeenCalledOnce();
-  // Media that loaded and later expires reads again, and meanwhile takes
-  // the links already read.
+  // The loaded video keeps its element and link, so it does not restart.
+  expect(container.querySelector("video")).toBe(video);
+  expect(video).toHaveAttribute("src", signedVideo("1"));
+  await act(async () => read.resolve());
+  // A renewed link that fails before loading does not read again.
   fireEvent.error(screen.getByAltText("Screenshot"));
+  expect(refresh).toHaveBeenCalledOnce();
+});
+
+it("reads again after a failed renewal, one read at a time", async () => {
+  const signedAfter =
+    "https://private-user-images.githubusercontent.com/1888043/2-dd1f7e4f-e2a4-4aec-b661-cb45032f29c5.mp4?jwt=1";
+  const first = deferred<void>();
+  const refresh = vi
+    .fn<() => Promise<void>>()
+    .mockReturnValueOnce(first.promise)
+    .mockResolvedValue(undefined);
+  const { container } = render(
+    <GitHubBody
+      url={url}
+      body={`${signedBody}\n\n${after}`}
+      bodyHtml={`${signedHtml("1")}<video src="${signedAfter}"></video>`}
+      refresh={refresh}
+    />,
+  );
+  const [video, later] = container.querySelectorAll("video");
+  if (!video || !later) throw new Error("Expected both videos");
+  expect(later).toHaveAttribute("src", signedAfter);
+  fireEvent.loadedData(video);
+  fireEvent.loadedData(later);
+  fireEvent.error(screen.getByAltText("Screenshot"));
+  // Media failing while a read is in flight waits for that read.
+  fireEvent.error(video);
+  expect(refresh).toHaveBeenCalledOnce();
+  await act(async () => first.reject(new Error("offline")));
+  // The read failed and nothing changed; media that expires later still
+  // reads again.
+  fireEvent.error(later);
   expect(refresh).toHaveBeenCalledTimes(2);
-  expect(sources()).toEqual([
-    signed("3"),
-    signedBefore.replace("expired", "3"),
-  ]);
 });
 
 it("keeps public and raw media on their own links without reading again", () => {
@@ -557,10 +586,12 @@ it.each([
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((done) => {
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((done, fail) => {
     resolve = done;
+    reject = fail;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 it("ignores retired PR loads, retries errors, and clears media when navigating", async () => {
@@ -663,4 +694,31 @@ it("reads the pull request again when its signed image fails", async () => {
     expect(screen.getByAltText("Screenshot")).toHaveAttribute("src", signed(2)),
   );
   expect(fetch).toHaveBeenCalledTimes(2);
+});
+
+it("keeps a shown issue when reading it again for its signed image fails", async () => {
+  const issue = "https://github.com/block/buzz-app/issues/5";
+  const fetch = vi
+    .fn()
+    .mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          title: "Private issue",
+          body: `![Screenshot](${image})`,
+          body_html: `<img src="${signedImage("1")}" alt="Screenshot">`,
+        }),
+      ),
+    )
+    .mockResolvedValueOnce(new Response(null, { status: 404 }));
+  vi.stubGlobal("fetch", fetch);
+  render(<GitHubPanel target={issue} close={() => {}} />);
+  fireEvent.error(await screen.findByAltText("Screenshot"));
+  await waitFor(() => expect(fetch).toHaveBeenCalledTimes(2));
+  await act(async () => {});
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  expect(screen.getByRole("heading", { name: "Private issue" })).toBeVisible();
+  expect(screen.getByRole("link", { name: "Screenshot" })).toHaveAttribute(
+    "href",
+    image,
+  );
 });
