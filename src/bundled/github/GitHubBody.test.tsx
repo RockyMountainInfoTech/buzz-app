@@ -25,7 +25,9 @@ const after =
 const image =
   "https://github.com/user-attachments/assets/cd0773ee-9861-46d9-8a0f-352ae951ec7f";
 const audio = "https://github.com/user-attachments/files/123/recording.wav";
-const metadata = `<details><summary>before.mp4</summary><video src="https://private-user-images.githubusercontent.com/1888043/659873452-81e77cff-0e61-4694-9a88-add0c1f997e4.mp4?jwt=expired"></video></details><video><source src="${after}" /></video>`;
+const signedBefore =
+  "https://private-user-images.githubusercontent.com/1888043/659873452-81e77cff-0e61-4694-9a88-add0c1f997e4.mp4?jwt=expired";
+const metadata = `<details><summary>before.mp4</summary><video src="${signedBefore}"></video></details><video><source src="${after}" /></video>`;
 
 afterEach(() => {
   cleanup();
@@ -58,7 +60,7 @@ it("renders GFM and Before/After players without duplicate loaded-media links", 
     [...container.querySelectorAll("h2, video")].map((node) =>
       node.tagName === "VIDEO" ? node.getAttribute("src") : node.textContent,
     ),
-  ).toEqual(["Before", before, "After", after]);
+  ).toEqual(["Before", signedBefore, "After", after]);
   expect(
     screen.getByRole("link", { name: "Result recording" }),
   ).toHaveAttribute("href", after);
@@ -211,6 +213,84 @@ it("keeps original links when media fails before loading", () => {
     expect(screen.getByRole("link", { name })).toBeVisible();
     expect(screen.getByRole("link", { name })).toHaveAttribute("href", href);
   }
+});
+
+it("shows private media from signed links and reads the body again once when they fail", () => {
+  const signed = (jwt: string) =>
+    `https://private-user-images.githubusercontent.com/1888043/1-cd0773ee-9861-46d9-8a0f-352ae951ec7f.png?jwt=${jwt}`;
+  const html = (jwt: string) =>
+    `<p><a href="${signed(jwt)}"><img src="${signed(jwt)}" alt="Screenshot"></a></p><video src="${signedBefore.replace("expired", jwt)}"></video>`;
+  const refresh = vi.fn();
+  const body = `![Screenshot](${image})\n\n${before}`;
+  const { container, rerender } = render(
+    <GitHubBody url={url} body={body} bodyHtml={html("1")} refresh={refresh} />,
+  );
+  const sources = () =>
+    [...container.querySelectorAll("img, video")].map((media) =>
+      media.getAttribute("src"),
+    );
+  expect(sources()).toEqual([
+    signed("1"),
+    signedBefore.replace("expired", "1"),
+  ]);
+  // Failing together, they read the body once; the original links remain.
+  fireEvent.error(screen.getByAltText("Screenshot"));
+  fireEvent.error(container.querySelector("video") as HTMLVideoElement);
+  expect(refresh).toHaveBeenCalledOnce();
+  expect(screen.getByRole("link", { name: "Screenshot" })).toHaveAttribute(
+    "href",
+    image,
+  );
+  expect(screen.getByRole("link", { name: before })).toHaveAttribute(
+    "href",
+    before,
+  );
+  rerender(
+    <GitHubBody url={url} body={body} bodyHtml={html("2")} refresh={refresh} />,
+  );
+  expect(sources()).toEqual([
+    signed("2"),
+    signedBefore.replace("expired", "2"),
+  ]);
+  // Working media keeps its source when the body is read again.
+  fireEvent.load(screen.getByAltText("Screenshot"));
+  rerender(
+    <GitHubBody url={url} body={body} bodyHtml={html("3")} refresh={refresh} />,
+  );
+  expect(screen.getByAltText("Screenshot")).toHaveAttribute("src", signed("2"));
+  // A renewed source that fails before loading does not read again.
+  fireEvent.error(container.querySelector("video") as HTMLVideoElement);
+  expect(refresh).toHaveBeenCalledOnce();
+  // Media that loaded and later expires reads again, and meanwhile takes
+  // the links already read.
+  fireEvent.error(screen.getByAltText("Screenshot"));
+  expect(refresh).toHaveBeenCalledTimes(2);
+  expect(sources()).toEqual([
+    signed("3"),
+    signedBefore.replace("expired", "3"),
+  ]);
+});
+
+it("keeps public and raw media on their own links without reading again", () => {
+  const raw = "https://raw.githubusercontent.com/block/buzz-app/main/icon.png";
+  const refresh = vi.fn();
+  render(
+    <GitHubBody
+      url={url}
+      body={`![Asset](${image})\n\n![Raw](${raw})`}
+      bodyHtml={`<img src="${image}" alt="Asset"><img src="https://camo.githubusercontent.com/1/2" data-canonical-src="${raw}" alt="Raw">`}
+      refresh={refresh}
+    />,
+  );
+  for (const [name, source] of [
+    ["Asset", image],
+    ["Raw", raw],
+  ] as const) {
+    expect(screen.getByAltText(name)).toHaveAttribute("src", source);
+    fireEvent.error(screen.getByAltText(name));
+    expect(screen.getByRole("link", { name })).toHaveAttribute("href", source);
+  }
+  expect(refresh).not.toHaveBeenCalled();
 });
 
 it("preserves HTML-only summaries, prose and file links", () => {
@@ -541,7 +621,7 @@ it("ignores retired PR loads, retries errors, and clears media when navigating",
   expect(
     screen.queryByRole("button", { name: "Description" }),
   ).not.toBeInTheDocument();
-  expect(container.querySelector("video")).toHaveAttribute("src", before);
+  expect(container.querySelector("video")).toHaveAttribute("src", signedBefore);
   const next = deferred<Response>();
   fetch.mockReturnValueOnce(next.promise);
   rerender(<GitHubPanel target={`${url}1`} close={() => {}} />);
@@ -556,4 +636,31 @@ it("ignores retired PR loads, retries errors, and clears media when navigating",
   ).toBeVisible();
   expect(container.querySelector("video")).toBeNull();
   expect(screen.getByRole("link", { name: before })).toBeVisible();
+});
+
+it("reads the pull request again when its signed image fails", async () => {
+  const signed = (read: number) =>
+    `https://private-user-images.githubusercontent.com/1/2-cd0773ee-9861-46d9-8a0f-352ae951ec7f.png?jwt=${read}`;
+  let reads = 0;
+  const fetch = vi.fn(async () => {
+    reads += 1;
+    return new Response(
+      JSON.stringify({
+        title: "Private PR",
+        body: `![Screenshot](${image})`,
+        body_html: `<img src="${signed(reads)}" alt="Screenshot">`,
+      }),
+    );
+  });
+  vi.stubGlobal("fetch", fetch);
+  render(<GitHubPanel target={url} close={() => {}} />);
+  expect(await screen.findByAltText("Screenshot")).toHaveAttribute(
+    "src",
+    signed(1),
+  );
+  fireEvent.error(screen.getByAltText("Screenshot"));
+  await waitFor(() =>
+    expect(screen.getByAltText("Screenshot")).toHaveAttribute("src", signed(2)),
+  );
+  expect(fetch).toHaveBeenCalledTimes(2);
 });

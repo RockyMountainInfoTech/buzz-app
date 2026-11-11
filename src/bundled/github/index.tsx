@@ -749,6 +749,7 @@ function ObjectPanel({
                         body={result.body}
                         bodyHtml={result.bodyHtml}
                         url={reference.url}
+                        refresh={load}
                       />
                     </div>
                   )}
@@ -759,6 +760,7 @@ function ObjectPanel({
                     body={result.body}
                     bodyHtml={result.bodyHtml}
                     url={reference.url}
+                    refresh={load}
                   />
                 )
               )}

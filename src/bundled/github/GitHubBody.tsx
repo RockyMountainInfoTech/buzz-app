@@ -2,7 +2,9 @@ import {
   Children,
   isValidElement,
   memo,
+  useCallback,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
@@ -176,18 +178,24 @@ function EmbeddedAttachment({
   children,
   fallback,
   caption,
+  onMedia,
 }: {
   children: ReactNode;
   fallback: ReactNode;
   caption: ReactNode;
+  onMedia?: ((loaded: boolean) => void) | undefined;
 }) {
   const [loaded, setLoaded] = useState(false);
+  const show = (next: boolean) => {
+    setLoaded(next);
+    onMedia?.(next);
+  };
   return (
     <div
       className={styles.attachment}
-      onLoadCapture={() => setLoaded(true)}
-      onLoadedDataCapture={() => setLoaded(true)}
-      onErrorCapture={() => setLoaded(false)}
+      onLoadCapture={() => show(true)}
+      onLoadedDataCapture={() => show(true)}
+      onErrorCapture={() => show(false)}
     >
       {children}
       {loaded ? caption : fallback}
@@ -195,14 +203,59 @@ function EmbeddedAttachment({
   );
 }
 
+/** Signed media links in `bodyHtml` change on every read and expire within
+ * minutes. The body keeps the links it shows, so media does not reload or
+ * restart, until the body changes or shown media fails; then it reads GitHub
+ * once with `refresh` and shows the links read. */
 export const GitHubBody = memo(function GitHubBody({
   body,
   bodyHtml,
   url,
+  refresh,
 }: {
   body: string;
   bodyHtml?: string | undefined;
   url: string;
+  refresh?: (() => void) | undefined;
+}) {
+  const [shown, setShown] = useState({ body, html: bodyHtml });
+  const [stale, setStale] = useState(false);
+  if (body !== shown.body || (stale && bodyHtml !== shown.html)) {
+    setShown({ body, html: bodyHtml });
+    setStale(false);
+  }
+  // Media that failed since it last loaded does not read again, and media
+  // failing together reads once.
+  const failed = useRef(new Set<string>());
+  const requested = useRef<string | undefined>(undefined);
+  const renew = useCallback(
+    (source: string, loaded: boolean) => {
+      if (loaded) failed.current.delete(source);
+      if (loaded || !refresh || failed.current.has(source)) return;
+      failed.current.add(source);
+      setStale(true);
+      if (requested.current === shown.html) return;
+      requested.current = shown.html;
+      refresh();
+    },
+    [refresh, shown.html],
+  );
+  return (
+    <Body body={shown.body} bodyHtml={shown.html} url={url} renew={renew} />
+  );
+});
+
+const Body = memo(function Body({
+  body,
+  bodyHtml,
+  url,
+  renew,
+}: {
+  body: string;
+  bodyHtml: string | undefined;
+  url: string;
+  /** Media with a signed source loaded, or failed. */
+  renew(source: string, loaded: boolean): void;
 }) {
   const bounded = useMemo(
     () => body.length <= MAX_MARKDOWN_LENGTH && !scanMarkdown(body).tooDeep,
@@ -228,8 +281,12 @@ export const GitHubBody = memo(function GitHubBody({
     );
     if (!attachment) return link;
     return (
+      // Media keeps a failure until remounted with a new source.
       <EmbeddedAttachment
-        key={source}
+        key={attachment.url}
+        {...(attachment.url !== source && {
+          onMedia: (loaded: boolean) => renew(source, loaded),
+        })}
         fallback={link}
         caption={
           !image && Children.toArray(label).some((part) => part !== source)
@@ -238,7 +295,7 @@ export const GitHubBody = memo(function GitHubBody({
         }
       >
         {attachment.kind === "audio" ? (
-          <AudioAttachment attachment={attachment} source={source} />
+          <AudioAttachment attachment={attachment} source={attachment.url} />
         ) : (
           <MediaAttachment
             attachment={attachment}
